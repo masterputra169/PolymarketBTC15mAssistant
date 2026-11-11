@@ -176,6 +176,12 @@ Example:
 npm start
 ```
 
+### Tests
+
+```bash
+npm test
+```
+
 ### Stop
 
 Press `Ctrl + C` in the terminal.
@@ -195,6 +201,12 @@ npm start
   - Ensure at least one working Polygon RPC URL is configured.
 - If the console looks like it “spams” lines:
   - The renderer uses `readline.cursorTo` + `clearScreenDown` for a stable, static screen, but some terminals may still behave differently.
+
+## Model notes (signal-only)
+
+- Advisory console signals only: **no Kelly sizing, fee model, slippage, exits, or order execution**.
+- Model blends short-term TA with a binary fair value \(P(S_T > K)\) from settlement spot vs price-to-beat; edge is model − ask (no ask renormalization).
+- Near expiry, moneyness/fair value dominates TA (probabilities do **not** decay to 50/50).
 
 ## Safety
 

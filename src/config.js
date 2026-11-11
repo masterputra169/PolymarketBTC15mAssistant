@@ -15,6 +15,40 @@ export const CONFIG = {
   macdSlow: 26,
   macdSignal: 9,
 
+  /** Lookback (1m bars) for binary fair-value σ estimate. */
+  fairVolLookbackBars: 30,
+
+  /**
+   * Live settlement latch is only trusted as strike if taken within this many
+   * ms after eventStartTime (opening print). Mid-window latches are display-only.
+   */
+  ptbOpenLatchGraceMs: 90_000,
+
+  /** Bars for recent vs average volume comparison (must match durations). */
+  volumeRecentBars: 20,
+  volumeAvgBars: 120,
+
+  /**
+   * Advisory decide thresholds / microstructure gates.
+   * Signal-only: no Kelly sizing, fee, or execution module.
+   */
+  decision: {
+    earlyMinutes: 10,
+    midMinutes: 5,
+    edgeEarly: 0.05,
+    edgeMid: 0.1,
+    edgeLate: 0.2,
+    probEarly: 0.55,
+    probMid: 0.6,
+    probLate: 0.65,
+    strengthStrong: 0.2,
+    strengthGood: 0.1,
+    edgeTieEpsilon: 1e-9,
+    blockRegimes: ["CHOP"],
+    maxSpread: 0.08,
+    minAskLiquidity: 50
+  },
+
   polymarket: {
     marketSlug: process.env.POLYMARKET_SLUG || "",
     seriesId: process.env.POLYMARKET_SERIES_ID || "10192",
