@@ -22,6 +22,17 @@ export function formatPct(x, digits = 2) {
   return `${(x * 100).toFixed(digits)}%`;
 }
 
+/**
+ * Format CLOB probability dollars ∈ [0,1] as cents for display (e.g. 0.55 → "55.0¢").
+ * Values already > 1 are treated as cents as-is.
+ */
+export function formatCents(price, digits = 1) {
+  if (price === null || price === undefined || Number.isNaN(Number(price))) return "-";
+  const p = Number(price);
+  const cents = p <= 1 ? p * 100 : p;
+  return `${cents.toFixed(digits)}¢`;
+}
+
 export function getCandleWindowTiming(windowMinutes) {
   const nowMs = Date.now();
   const windowMs = windowMinutes * 60_000;

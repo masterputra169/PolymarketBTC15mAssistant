@@ -166,26 +166,15 @@ export async function fetchOrderBook({ tokenId }) {
 }
 
 export function summarizeOrderBook(book, depthLevels = 5) {
-  const bids = Array.isArray(book?.bids) ? book.bids : [];
-  const asks = Array.isArray(book?.asks) ? book.asks : [];
+  const rawBids = Array.isArray(book?.bids) ? book.bids : [];
+  const rawAsks = Array.isArray(book?.asks) ? book.asks : [];
 
-  const bestBid = bids.length
-    ? bids.reduce((best, lvl) => {
-        const p = toNumber(lvl.price);
-        if (p === null) return best;
-        if (best === null) return p;
-        return Math.max(best, p);
-      }, null)
-    : null;
+  // Sort before depth slice: bids high→low, asks low→high.
+  const bids = [...rawBids].sort((a, b) => (toNumber(b.price) ?? -Infinity) - (toNumber(a.price) ?? -Infinity));
+  const asks = [...rawAsks].sort((a, b) => (toNumber(a.price) ?? Infinity) - (toNumber(b.price) ?? Infinity));
 
-  const bestAsk = asks.length
-    ? asks.reduce((best, lvl) => {
-        const p = toNumber(lvl.price);
-        if (p === null) return best;
-        if (best === null) return p;
-        return Math.min(best, p);
-      }, null)
-    : null;
+  const bestBid = bids.length ? toNumber(bids[0].price) : null;
+  const bestAsk = asks.length ? toNumber(asks[0].price) : null;
   const spread = bestBid !== null && bestAsk !== null ? bestAsk - bestBid : null;
 
   const bidLiquidity = bids.slice(0, depthLevels).reduce((acc, x) => acc + (toNumber(x.size) ?? 0), 0);

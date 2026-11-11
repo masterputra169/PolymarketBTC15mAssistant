@@ -12,14 +12,20 @@ import {
   fetchOrderBook,
   summarizeOrderBook
 } from "./data/polymarket.js";
-import { computeSessionVwap, computeVwapSeries } from "./indicators/vwap.js";
-import { computeRsi, sma, slopeLast } from "./indicators/rsi.js";
+import { priceToBeatFromPolymarketMarket } from "./data/priceToBeat.js";
+import { computeVwapSeries, filterCandlesForMarketWindow } from "./indicators/vwap.js";
+import { computeRsi, computeRsiSeries, sma, slopeLast } from "./indicators/rsi.js";
 import { computeMacd } from "./indicators/macd.js";
 import { computeHeikenAshi, countConsecutive } from "./indicators/heikenAshi.js";
 import { detectRegime } from "./engines/regime.js";
-import { scoreDirection, applyTimeAwareness } from "./engines/probability.js";
+import {
+  scoreDirection,
+  applyTimeAwareness,
+  binaryFairProbUp,
+  estimateLogReturnVol
+} from "./engines/probability.js";
 import { computeEdge, decide } from "./engines/edge.js";
-import { appendCsvRow, formatNumber, formatPct, getCandleWindowTiming, sleep } from "./utils.js";
+import { appendCsvRow, formatCents, formatNumber, formatPct, getCandleWindowTiming, sleep } from "./utils.js";
 import { startBinanceTradeStream } from "./data/binanceWs.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -198,84 +204,6 @@ function getBtcSession(now = new Date()) {
   return "Off-hours";
 }
 
-function parsePriceToBeat(market) {
-  const text = String(market?.question ?? market?.title ?? "");
-  if (!text) return null;
-  const m = text.match(/price\s*to\s*beat[^\d$]*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
-  if (!m) return null;
-  const raw = m[1].replace(/,/g, "");
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : null;
-}
-
-const dumpedMarkets = new Set();
-
-function safeFileSlug(x) {
-  return String(x ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/(^-|-$)/g, "")
-    .slice(0, 120);
-}
-
-function extractNumericFromMarket(market) {
-  const directKeys = [
-    "priceToBeat",
-    "price_to_beat",
-    "strikePrice",
-    "strike_price",
-    "strike",
-    "threshold",
-    "thresholdPrice",
-    "threshold_price",
-    "targetPrice",
-    "target_price",
-    "referencePrice",
-    "reference_price"
-  ];
-
-  for (const k of directKeys) {
-    const v = market?.[k];
-    const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
-    if (Number.isFinite(n)) return n;
-  }
-
-  const seen = new Set();
-  const stack = [{ obj: market, depth: 0 }];
-
-  while (stack.length) {
-    const { obj, depth } = stack.pop();
-    if (!obj || typeof obj !== "object") continue;
-    if (seen.has(obj) || depth > 6) continue;
-    seen.add(obj);
-
-    const entries = Array.isArray(obj) ? obj.entries() : Object.entries(obj);
-    for (const [key, value] of entries) {
-      const k = String(key).toLowerCase();
-      if (value && typeof value === "object") {
-        stack.push({ obj: value, depth: depth + 1 });
-        continue;
-      }
-
-      if (!/(price|strike|threshold|target|beat)/i.test(k)) continue;
-
-      const n = typeof value === "string" ? Number(value) : typeof value === "number" ? value : NaN;
-      if (!Number.isFinite(n)) continue;
-
-      if (n > 1000 && n < 2_000_000) return n;
-    }
-  }
-
-  return null;
-}
-
-function priceToBeatFromPolymarketMarket(market) {
-  const n = extractNumericFromMarket(market);
-  if (n !== null) return n;
-  return parsePriceToBeat(market);
-}
-
 const marketCache = {
   market: null,
   fetchedAtMs: 0
@@ -402,7 +330,7 @@ async function main() {
 
   let prevSpotPrice = null;
   let prevCurrentPrice = null;
-  let priceToBeatState = { slug: null, value: null, setAtMs: null };
+  let priceToBeatState = { slug: null, value: null, source: null, setAtMs: null };
 
   const header = [
     "timestamp",
@@ -438,9 +366,8 @@ async function main() {
           ? Promise.resolve({ price: chainlinkWsPrice, updatedAt: chainlinkWsTick?.updatedAt ?? null, source: "chainlink_ws" })
           : fetchChainlinkBtcUsd();
 
-      const [klines1m, klines5m, lastPrice, chainlink, poly] = await Promise.all([
+      const [klines1m, lastPrice, chainlink, poly] = await Promise.all([
         fetchKlines({ interval: "1m", limit: 240 }),
-        fetchKlines({ interval: "5m", limit: 200 }),
         fetchLastPrice(),
         chainlinkPromise,
         fetchPolymarketSnapshot()
@@ -451,42 +378,57 @@ async function main() {
 
       const timeLeftMin = settlementLeftMin ?? timing.remainingMinutes;
 
-      const candles = klines1m;
+      const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
+
+      // Full history for RSI/MACD/vol; VWAP reset to current market window.
+      const candlesAll = klines1m;
+      const closesAll = candlesAll.map((c) => c.close);
+
+      const windowCandles = filterCandlesForMarketWindow(candlesAll, {
+        eventStartMs: marketStartMs,
+        windowMinutes: CONFIG.candleWindowMinutes,
+        nowMs: Date.now()
+      });
+      const candles = windowCandles.length >= 2 ? windowCandles : candlesAll;
       const closes = candles.map((c) => c.close);
 
-      const vwap = computeSessionVwap(candles);
       const vwapSeries = computeVwapSeries(candles);
-      const vwapNow = vwapSeries[vwapSeries.length - 1];
+      const vwapNow = vwapSeries.length ? vwapSeries[vwapSeries.length - 1] : null;
 
       const lookback = CONFIG.vwapSlopeLookbackMinutes;
-      const vwapSlope = vwapSeries.length >= lookback ? (vwapNow - vwapSeries[vwapSeries.length - lookback]) / lookback : null;
-      const vwapDist = vwapNow ? (lastPrice - vwapNow) / vwapNow : null;
+      const vwapSlope = vwapSeries.length >= lookback && vwapNow !== null
+        ? (vwapNow - vwapSeries[vwapSeries.length - lookback]) / lookback
+        : null;
 
-      const rsiNow = computeRsi(closes, CONFIG.rsiPeriod);
-      const rsiSeries = [];
-      for (let i = 0; i < closes.length; i += 1) {
-        const sub = closes.slice(0, i + 1);
-        const r = computeRsi(sub, CONFIG.rsiPeriod);
-        if (r !== null) rsiSeries.push(r);
-      }
+      const settlementSpot = chainlink?.price ?? null;
+      const modelPrice = settlementSpot ?? lastPrice;
+      const vwapDist = vwapNow && modelPrice !== null ? (modelPrice - vwapNow) / vwapNow : null;
+
+      const rsiNow = computeRsi(closesAll, CONFIG.rsiPeriod);
+      const rsiSeriesRaw = computeRsiSeries(closesAll, CONFIG.rsiPeriod);
+      const rsiSeries = rsiSeriesRaw.filter((r) => r !== null);
       const rsiMa = sma(rsiSeries, CONFIG.rsiMaPeriod);
       const rsiSlope = slopeLast(rsiSeries, 3);
 
-      const macd = computeMacd(closes, CONFIG.macdFast, CONFIG.macdSlow, CONFIG.macdSignal);
+      const macd = computeMacd(closesAll, CONFIG.macdFast, CONFIG.macdSlow, CONFIG.macdSignal);
 
       const ha = computeHeikenAshi(candles);
       const consec = countConsecutive(ha);
 
-      const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
+      const vwapCrossCount = countVwapCrosses(closes, vwapSeries, Math.min(20, closes.length));
       const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
-      const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
+      const volumeAvg = candlesAll.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
 
       const failedVwapReclaim = vwapNow !== null && vwapSeries.length >= 3
         ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
         : false;
+      // Mirror: failed reject from below (bounce failed → bullish reclaim attempt broke).
+      const failedVwapReject = vwapNow !== null && vwapSeries.length >= 3
+        ? closes[closes.length - 1] > vwapNow && closes[closes.length - 2] < vwapSeries[vwapSeries.length - 2]
+        : false;
 
       const regimeInfo = detectRegime({
-        price: lastPrice,
+        price: modelPrice,
         vwap: vwapNow,
         vwapSlope,
         vwapCrossCount,
@@ -495,7 +437,7 @@ async function main() {
       });
 
       const scored = scoreDirection({
-        price: lastPrice,
+        price: modelPrice,
         vwap: vwapNow,
         vwapSlope,
         rsi: rsiNow,
@@ -503,16 +445,98 @@ async function main() {
         macd,
         heikenColor: consec.color,
         heikenCount: consec.count,
-        failedVwapReclaim
+        failedVwapReclaim,
+        failedVwapReject
       });
 
-      const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes);
+      const spotPrice = wsPrice ?? lastPrice;
+      const currentPrice = settlementSpot;
+      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
+
+      // PTB: prefer official market field/question parse; live latch only as unofficial fallback.
+      if (marketSlug && priceToBeatState.slug !== marketSlug) {
+        const official = poly.ok ? priceToBeatFromPolymarketMarket(poly.market) : null;
+        priceToBeatState = official !== null
+          ? { slug: marketSlug, value: official, source: "official", setAtMs: Date.now() }
+          : { slug: marketSlug, value: null, source: null, setAtMs: null };
+      } else if (
+        marketSlug &&
+        priceToBeatState.slug === marketSlug &&
+        priceToBeatState.source !== "official" &&
+        poly.ok
+      ) {
+        const official = priceToBeatFromPolymarketMarket(poly.market);
+        if (official !== null) {
+          priceToBeatState = { slug: marketSlug, value: official, source: "official", setAtMs: Date.now() };
+        }
+      }
+
+      if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
+        const nowMs = Date.now();
+        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
+        if (okToLatch) {
+          priceToBeatState = {
+            slug: priceToBeatState.slug,
+            value: Number(currentPrice),
+            source: "live_latch_unofficial",
+            setAtMs: nowMs
+          };
+        }
+      }
+
+      const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
+      const ptbSource = priceToBeatState.slug === marketSlug ? priceToBeatState.source : null;
+
+      const sigma = estimateLogReturnVol(closesAll, CONFIG.fairVolLookbackBars);
+      const fairUp = binaryFairProbUp({
+        spot: modelPrice,
+        strike: priceToBeat,
+        remainingMinutes: timeLeftMin,
+        sigmaPerSqrtMinute: sigma
+      });
+
+      const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes, { fairUp });
 
       const marketUp = poly.ok ? poly.prices.up : null;
       const marketDown = poly.ok ? poly.prices.down : null;
-      const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
 
-      const rec = decide({ remainingMinutes: timeLeftMin, edgeUp: edge.edgeUp, edgeDown: edge.edgeDown, modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown });
+      const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
+      const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
+      const spread = spreadUp !== null && spreadDown !== null
+        ? Math.max(spreadUp, spreadDown)
+        : (spreadUp ?? spreadDown);
+
+      const askLiquidityRaw = poly.ok
+        ? Math.min(
+          poly.orderbook.up.askLiquidity ?? Infinity,
+          poly.orderbook.down.askLiquidity ?? Infinity
+        )
+        : null;
+      const askLiquidityForDecide = askLiquidityRaw !== null && Number.isFinite(askLiquidityRaw)
+        ? askLiquidityRaw
+        : null;
+
+      const liquidity = poly.ok
+        ? (Number(poly.market?.liquidityNum) || Number(poly.market?.liquidity) || null)
+        : null;
+
+      const edge = computeEdge({
+        modelUp: timeAware.adjustedUp,
+        modelDown: timeAware.adjustedDown,
+        marketYes: marketUp,
+        marketNo: marketDown
+      });
+
+      const rec = decide({
+        remainingMinutes: timeLeftMin,
+        edgeUp: edge.edgeUp,
+        edgeDown: edge.edgeDown,
+        modelUp: timeAware.adjustedUp,
+        modelDown: timeAware.adjustedDown,
+        regime: regimeInfo.regime,
+        spread,
+        askLiquidity: askLiquidityForDecide
+      });
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
@@ -536,21 +560,18 @@ async function main() {
 
       const pLong = timeAware?.adjustedUp ?? null;
       const pShort = timeAware?.adjustedDown ?? null;
-      const predictNarrative = (pLong !== null && pShort !== null && Number.isFinite(pLong) && Number.isFinite(pShort))
-        ? (pLong > pShort ? "LONG" : pShort > pLong ? "SHORT" : "NEUTRAL")
-        : "NEUTRAL";
       const predictValue = `${ANSI.green}LONG${ANSI.reset} ${ANSI.green}${formatProbPct(pLong, 0)}${ANSI.reset} / ${ANSI.red}SHORT${ANSI.reset} ${ANSI.red}${formatProbPct(pShort, 0)}${ANSI.reset}`;
-      const predictLine = `Predict: ${predictValue}`;
 
-      const marketUpStr = `${marketUp ?? "-"}${marketUp === null || marketUp === undefined ? "" : "¢"}`;
-      const marketDownStr = `${marketDown ?? "-"}${marketDown === null || marketDown === undefined ? "" : "¢"}`;
+      const marketUpStr = formatCents(marketUp);
+      const marketDownStr = formatCents(marketDown);
       const polyHeaderValue = `${ANSI.green}↑ UP${ANSI.reset} ${marketUpStr}  |  ${ANSI.red}↓ DOWN${ANSI.reset} ${marketDownStr}`;
 
       const heikenValue = `${consec.color ?? "-"} x${consec.count}`;
       const heikenLine = formatNarrativeValue("Heiken Ashi", heikenValue, haNarrative);
 
       const rsiArrow = rsiSlope !== null && rsiSlope < 0 ? "↓" : rsiSlope !== null && rsiSlope > 0 ? "↑" : "-";
-      const rsiValue = `${formatNumber(rsiNow, 1)} ${rsiArrow}`;
+      const rsiMaStr = rsiMa !== null ? ` MA ${formatNumber(rsiMa, 1)}` : "";
+      const rsiValue = `${formatNumber(rsiNow, 1)} ${rsiArrow}${rsiMaStr}`;
       const rsiLine = formatNarrativeValue("RSI", rsiValue, rsiNarrative);
 
       const macdLine = formatNarrativeValue("MACD", macdLabel, macdNarrative);
@@ -566,35 +587,14 @@ async function main() {
       const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
       const actionLine = rec.action === "ENTER"
-        ? `${rec.action} NOW (${rec.phase} ENTRY)`
-        : `NO TRADE (${rec.phase})`;
+        ? `${rec.action} ${rec.side} (${rec.phase} ${rec.strength})`
+        : `NO TRADE (${rec.phase}${rec.reason ? ` · ${rec.reason}` : ""})`;
 
-      const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
-      const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
+      const signalColor = rec.action === "ENTER"
+        ? (rec.side === "UP" ? ANSI.green : ANSI.red)
+        : ANSI.gray;
+      const signalDisplay = `${signalColor}${actionLine}${ANSI.reset}`;
 
-      const spread = spreadUp !== null && spreadDown !== null ? Math.max(spreadUp, spreadDown) : (spreadUp ?? spreadDown);
-      const liquidity = poly.ok
-        ? (Number(poly.market?.liquidityNum) || Number(poly.market?.liquidity) || null)
-        : null;
-
-      const spotPrice = wsPrice ?? lastPrice;
-      const currentPrice = chainlink?.price ?? null;
-      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
-      const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
-
-      if (marketSlug && priceToBeatState.slug !== marketSlug) {
-        priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
-      }
-
-      if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
-        const nowMs = Date.now();
-        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
-        if (okToLatch) {
-          priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
-        }
-      }
-
-      const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
       const currentPriceBaseLine = colorPriceLine({
         label: "CURRENT PRICE",
         price: currentPrice,
@@ -619,7 +619,7 @@ async function main() {
       const currentPriceValue = currentPriceBaseLine.split(": ")[1] ?? currentPriceBaseLine;
       const currentPriceLine = kv("CURRENT PRICE:", `${currentPriceValue} (${ptbDeltaText})`);
 
-      if (poly.ok && poly.market && priceToBeatState.value === null) {
+      if (poly.ok && poly.market && (priceToBeatState.value === null || ptbSource === "live_latch_unofficial")) {
         const slug = safeFileSlug(poly.market.slug || poly.market.id || "market");
         if (slug && !dumpedMarkets.has(slug)) {
           dumpedMarkets.add(slug);
@@ -655,7 +655,6 @@ async function main() {
           : timeLeftMin >= 0 && timeLeftMin < 5
             ? ANSI.red
             : ANSI.reset;
-      const timeLeftLine = `⏱ Time left: ${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`;
 
       const polyTimeLeftColor = settlementLeftMin !== null
         ? (settlementLeftMin >= 10 && settlementLeftMin <= 15
@@ -667,6 +666,12 @@ async function main() {
               : ANSI.reset)
         : ANSI.reset;
 
+      const ptbLabel = priceToBeat !== null
+        ? `$${formatNumber(priceToBeat, 0)}${ptbSource === "live_latch_unofficial" ? ` ${ANSI.yellow}(unofficial)${ANSI.reset}` : ""}`
+        : `${ANSI.gray}-${ANSI.reset}`;
+
+      const fairStr = fairUp !== null ? formatProbPct(fairUp, 0) : "-";
+
       const lines = [
         titleLine,
         marketLine,
@@ -674,6 +679,9 @@ async function main() {
         "",
         sepLine(),
         "",
+        kv("Signal:", signalDisplay),
+        kv("Regime:", regimeInfo.regime),
+        kv("Model / Fair:", `${formatProbPct(timeAware.adjustedUp, 0)} up · fair ${fairStr}`),
         kv("TA Predict:", predictValue),
         kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
         kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
@@ -685,8 +693,9 @@ async function main() {
         "",
         kv("POLYMARKET:", polyHeaderValue),
         liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
+        spread !== null ? kv("Spread:", formatNumber(spread, 4)) : null,
         settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("PRICE TO BEAT: ", `$${formatNumber(priceToBeat, 0)}`) : kv("PRICE TO BEAT: ", `${ANSI.gray}-${ANSI.reset}`),
+        kv("PRICE TO BEAT: ", ptbLabel),
         currentPriceLine,
         "",
         sepLine(),
