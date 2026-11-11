@@ -19,6 +19,16 @@ export const CONFIG = {
   fairVolLookbackBars: 30,
 
   /**
+   * Live settlement latch is only trusted as strike if taken within this many
+   * ms after eventStartTime (opening print). Mid-window latches are display-only.
+   */
+  ptbOpenLatchGraceMs: 90_000,
+
+  /** Bars for recent vs average volume comparison (must match durations). */
+  volumeRecentBars: 20,
+  volumeAvgBars: 120,
+
+  /**
    * Advisory decide thresholds / microstructure gates.
    * Signal-only: no Kelly sizing, fee, or execution module.
    */

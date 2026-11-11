@@ -25,6 +25,8 @@ import {
   estimateLogReturnVol
 } from "./engines/probability.js";
 import { computeEdge, decide } from "./engines/edge.js";
+import { classifyLivePtbLatch, resolveFairStrike } from "./engines/ptbStrike.js";
+import { computeVolumeRecentAvg } from "./engines/volume.js";
 import { appendCsvRow, formatCents, formatNumber, formatPct, getCandleWindowTiming, sleep } from "./utils.js";
 import { startBinanceTradeStream } from "./data/binanceWs.js";
 import fs from "node:fs";
@@ -416,8 +418,12 @@ async function main() {
       const consec = countConsecutive(ha);
 
       const vwapCrossCount = countVwapCrosses(closes, vwapSeries, Math.min(20, closes.length));
-      const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
-      const volumeAvg = candlesAll.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
+      // Full-history candles so recent/avg durations match (not truncated window candles).
+      const { volumeRecent, volumeAvg } = computeVolumeRecentAvg(
+        candlesAll,
+        CONFIG.volumeRecentBars,
+        CONFIG.volumeAvgBars
+      );
 
       const failedVwapReclaim = vwapNow !== null && vwapSeries.length >= 3
         ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
@@ -453,7 +459,8 @@ async function main() {
       const currentPrice = settlementSpot;
       const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
 
-      // PTB: prefer official market field/question parse; live latch only as unofficial fallback.
+      // PTB: prefer official parse. Live latch only near event start is trusted for fair value;
+      // mid-window latches are display-only and must NOT feed binaryFairProbUp.
       if (marketSlug && priceToBeatState.slug !== marketSlug) {
         const official = poly.ok ? priceToBeatFromPolymarketMarket(poly.market) : null;
         priceToBeatState = official !== null
@@ -473,24 +480,30 @@ async function main() {
 
       if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
         const nowMs = Date.now();
-        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
-        if (okToLatch) {
+        const latchKind = classifyLivePtbLatch({
+          nowMs,
+          marketStartMs,
+          graceMs: CONFIG.ptbOpenLatchGraceMs
+        });
+        if (latchKind) {
           priceToBeatState = {
             slug: priceToBeatState.slug,
             value: Number(currentPrice),
-            source: "live_latch_unofficial",
+            source: latchKind,
             setAtMs: nowMs
           };
         }
+        // No eventStartTime / before start → cannot verify opening print; do not latch.
       }
 
       const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
       const ptbSource = priceToBeatState.slug === marketSlug ? priceToBeatState.source : null;
+      const fairStrike = resolveFairStrike({ value: priceToBeat, source: ptbSource });
 
       const sigma = estimateLogReturnVol(closesAll, CONFIG.fairVolLookbackBars);
       const fairUp = binaryFairProbUp({
         spot: modelPrice,
-        strike: priceToBeat,
+        strike: fairStrike,
         remainingMinutes: timeLeftMin,
         sigmaPerSqrtMinute: sigma
       });
@@ -666,8 +679,14 @@ async function main() {
               : ANSI.reset)
         : ANSI.reset;
 
+      const ptbSuffix =
+        ptbSource === "live_latch_unofficial"
+          ? ` ${ANSI.yellow}(unofficial · display only)${ANSI.reset}`
+          : ptbSource === "live_latch_open"
+            ? ` ${ANSI.gray}(open latch)${ANSI.reset}`
+            : "";
       const ptbLabel = priceToBeat !== null
-        ? `$${formatNumber(priceToBeat, 0)}${ptbSource === "live_latch_unofficial" ? ` ${ANSI.yellow}(unofficial)${ANSI.reset}` : ""}`
+        ? `$${formatNumber(priceToBeat, 0)}${ptbSuffix}`
         : `${ANSI.gray}-${ANSI.reset}`;
 
       const fairStr = fairUp !== null ? formatProbPct(fairUp, 0) : "-";
